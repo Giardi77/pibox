@@ -18,12 +18,14 @@ Commands:
 
 - `pibox rebuild [-t <template>]` — build or rebuild a base image from a template (default: `default`)
 - `pibox new <name> [src-dir] [-t <template>]` — clone a base into a fresh VM and copy `src-dir` (default: current dir) into `~/workspace`. Auto-builds the base on first use.
-- `pibox attach <name>` — SSH in, land in the workspace
-- `pibox commit <name> [dest]` — copy `~/workspace/persistent/` out to your Mac; VM keeps running
-- `pibox end <name> [dest]` — final copy of `persistent/`, then destroy the VM
+- `pibox start <name>` — start or resume an existing engagement VM after it was stopped
+- `pibox stop <name>` — stop an existing engagement VM without deleting it
+- `pibox attach <name>` or `pibox a <name>` — start the VM if needed, then SSH in and land in the workspace
+- `pibox commit <name> [dest]` — start the VM if needed, then copy `~/workspace/persistent/` out to your Mac; VM keeps running
+- `pibox delete <name> [dest]` or `pibox d <name> [dest]` — start the VM if needed, do a final copy of `persistent/`, then destroy the VM
 - `pibox status` — show all templates, which have built bases, disk sizes, tool versions
-- `pibox sync-pi <name>` — copy `~/.pi/` from Mac into a running VM
-- `pibox list` — show all VMs
+- `pibox sync-pi <name>` — start the VM if needed, then copy `~/.pi/` from Mac into it
+- `pibox list` or `pibox l` — show all VMs
 
 The persistence rule is the whole point: **only files under `~/workspace/persistent/` survive the VM**. Everything else dies with it. This is the boundary that makes prompt injection cheap to recover from — whatever the agent did, you throw the VM away and you're clean.
 
@@ -35,20 +37,23 @@ OrbStack runs every container and Linux machine in **one shared VM with a shared
 
 Docker Desktop is similar — one VM, many containers, shared state.
 
-Lima gives you **one real VM per instance**, isolated from each other and from your Mac. `pibox end` destroys that VM entirely. Next engagement starts from zero.
+Lima gives you **one real VM per instance**, isolated from each other and from your Mac. `pibox delete` destroys that VM entirely. Next engagement starts from zero.
 
 ## The flow
 
 ```bash
 cd ~/projects/engagement-42
 pibox new engagement-42         # auto-builds 'default' base first time (~5 min), clones it (~15s)
-ssh engagement-42               # or: pibox attach engagement-42
+ssh engagement-42               # or: pibox attach engagement-42 / pibox a engagement-42
 # ... run the agent, save keepers under ~/workspace/persistent/ ...
 pibox commit engagement-42      # optional: checkpoint to Mac
-pibox end engagement-42         # final pull + destroy
+pibox stop engagement-42        # pause without destroying the workspace VM
+# later, after a Mac shutdown or any stop:
+pibox start engagement-42       # resume the same workspace VM
+pibox delete engagement-42      # final pull + destroy
 ```
 
-Anything the agent produced that isn't under `persistent/` is gone after `end`. By design.
+Anything the agent produced that isn't under `persistent/` is gone after `delete`. By design.
 
 ## Templates and bases
 

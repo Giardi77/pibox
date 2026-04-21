@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PIBOX_VERSION="__PIBOX_VERSION__"
+
 PIBOX_HOME="${PIBOX_HOME:-$HOME/.pibox}"
 TEMPLATES_DIR="$PIBOX_HOME/templates"
 CONTAINER_DIR="$PIBOX_HOME/container"
@@ -10,6 +12,51 @@ SSH_CONFIG_FILE="$SSH_CONFIG_DIR/hosts"
 BASE_PREFIX="pibox-base-"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+print_usage() {
+  cat <<EOF
+usage: $(basename "$0") <command> [args]
+
+templates live in: $TEMPLATES_DIR/
+default template: 'default' (uses $TEMPLATES_DIR/default.yaml)
+
+base images:
+  rebuild [-t <template>]         build/rebuild a base (default: 'default')
+  status                          show all templates and their bases
+
+engagements:
+  new <name> [src-dir] [-t <template>]
+                                  clone base from template (auto-builds on first use),
+                                  copy src-dir to ~/workspace, sync ~/.pi
+  start    <name>                 start/resume an existing engagement VM
+  stop     <name>                 stop an existing engagement VM without deleting it
+  attach|a <name>                 start if needed, then SSH into VM
+  sync-pi  <name>                 start if needed, then copy ~/.pi/ from Mac
+  commit   <name> [dest]          start if needed, pull persistent/ to dest
+  delete|d <name> [dest]          start if needed, final pull + destroy VM
+  list|l                          list all VMs
+
+env vars:
+  PIBOX_HOME               (default: ~/.pibox)
+  PIBOX_PERSIST_ROOT       where commits go (default: ~/pibox-output)
+  PIBOX_SSH_CONFIG_DIR     (default: ~/.ssh/pibox.config)
+  PIBOX_CPUS               (default: 8)
+  PIBOX_MEMORY             GiB (default: 16)
+  PIBOX_DISK               GiB (default: 200)
+  PIBOX_SKIP_PI_SYNC       set to skip ~/.pi sync on 'new'
+EOF
+}
+
+case "${1:-}" in
+  --version|-V|version)
+    echo "pibox $PIBOX_VERSION"
+    exit 0
+    ;;
+  --help|-h|help)
+    print_usage
+    exit 0
+    ;;
+esac
 
 # ---------- template + base helpers ----------
 
@@ -38,6 +85,52 @@ vm_home_of() {
 
 vm_exists() {
   limactl list --format='{{.Name}}' 2>/dev/null | grep -qx "$1"
+}
+
+vm_status() {
+  local status
+  status="$(limactl list "$1" --format='{{.Status}}' 2>/dev/null | head -n1 | tr -d '[:space:]')" || return 1
+  [[ -n "$status" ]] || return 1
+  echo "$status"
+}
+
+vm_running() {
+  [[ "$(vm_status "$1" 2>/dev/null || true)" == "Running" ]]
+}
+
+start_vm() {
+  local name="$1"
+  vm_exists "$name" || die "VM not found: $name"
+
+  if vm_running "$name"; then
+    echo ">> $name already running"
+    return 0
+  fi
+
+  echo ">> starting $name"
+  limactl start "$name"
+
+  echo ">> refreshing SSH host"
+  register_ssh_host "$name"
+}
+
+stop_vm() {
+  local name="$1"
+  vm_exists "$name" || die "VM not found: $name"
+
+  if ! vm_running "$name"; then
+    echo ">> $name already stopped"
+    return 0
+  fi
+
+  echo ">> stopping $name"
+  limactl stop "$name"
+}
+
+ensure_vm_running() {
+  local name="$1"
+  vm_exists "$name" || die "VM not found: $name"
+  vm_running "$name" || start_vm "$name"
 }
 
 # ---------- pi config sync ----------
@@ -199,17 +292,6 @@ parse_template_flag() {
 
 # ---------- main ----------
 
-case "${1:-}" in
-  --help|-h|help)
-    # your existing usage block
-    exit 0
-    ;;
-  --version|-V|version)
-    echo "pibox 0.1.0"
-    exit 0
-    ;;
-esac
-
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
@@ -251,13 +333,28 @@ case "$cmd" in
     echo ">> ready ($TEMPLATE). connect with: ssh $name"
     ;;
 
-  attach)
-    name="${1:?usage: attach <name>}"
+  start)
+    name="${1:?usage: start <name>}"
+    [[ "$name" == pibox-base-* ]] && die "starting base VMs manually is not supported"
+    start_vm "$name"
+    echo ">> ready. connect with: ssh $name"
+    ;;
+
+  stop)
+    name="${1:?usage: stop <name>}"
+    [[ "$name" == pibox-base-* ]] && die "stopping base VMs manually is not supported"
+    stop_vm "$name"
+    ;;
+
+  attach|a)
+    name="${1:?usage: attach|a <name>}"
+    ensure_vm_running "$name"
     ssh -t "$name" 'cd "$HOME/workspace" && exec $SHELL -l'
     ;;
 
   sync-pi)
     name="${1:?usage: sync-pi <name>}"
+    ensure_vm_running "$name"
     vm_home=$(vm_home_of "$name")
     sync_pi_config "$name" "$vm_home"
     ;;
@@ -265,6 +362,7 @@ case "$cmd" in
   commit)
     name="${1:?usage: commit <name> [dest-dir]}"
     dest="${2:-$PERSIST_ROOT/$name-$(date +%Y%m%d-%H%M%S)}"
+    ensure_vm_running "$name"
     mkdir -p "$dest"
     vm_home=$(vm_home_of "$name")
     echo ">> pulling persistent/ -> $dest"
@@ -273,20 +371,16 @@ case "$cmd" in
     echo ">> committed to $dest"
     ;;
 
-  end)
-    name="${1:?usage: end <name> [dest-dir]}"
+  delete|d)
+    name="${1:?usage: delete|d <name> [dest-dir]}"
     [[ "$name" == pibox-base-* ]] && die "use 'pibox rebuild -t <template>' to refresh a base"
     dest="${2:-$PERSIST_ROOT/$name-final-$(date +%Y%m%d-%H%M%S)}"
+    ensure_vm_running "$name"
     mkdir -p "$dest"
-
-    vm_home=$(vm_home_of "$name" 2>/dev/null || echo "")
-    if [[ -n "$vm_home" ]]; then
-      echo ">> final pull of persistent/ -> $dest"
-      limactl shell "$name" -- tar -C "$vm_home/workspace/persistent" -cf - . | \
-        tar -C "$dest" -xf - || echo "warning: persistent pull failed, continuing"
-    else
-      echo "warning: could not query VM home, skipping pull"
-    fi
+    vm_home=$(vm_home_of "$name")
+    echo ">> final pull of persistent/ -> $dest"
+    limactl shell "$name" -- tar -C "$vm_home/workspace/persistent" -cf - . | \
+      tar -C "$dest" -xf - || echo "warning: persistent pull failed, continuing"
 
     echo ">> stopping and destroying VM"
     limactl stop --force "$name" 2>/dev/null || true
@@ -331,49 +425,24 @@ case "$cmd" in
     done
     [[ $any -eq 0 ]] && echo "no templates found in $TEMPLATES_DIR"
 
-    echo "active pibox VMs:"
-    active=$(limactl list --format='{{.Name}}\t{{.Status}}' 2>/dev/null | grep -v "^pibox-base-" || true)
+    echo "engagement VMs:"
+    active=$(limactl list --format='{{.Name}}|{{.Status}}' 2>/dev/null | grep -v "^pibox-base-" || true)
     if [[ -n "$active" ]]; then
-      echo "$active" | sed 's/^/  /'
+      while IFS='|' read -r vm_name vm_status; do
+        [[ -n "$vm_name" ]] || continue
+        printf '  %-24s %s\n' "$vm_name" "$vm_status"
+      done <<< "$active"
     else
       echo "  (none)"
     fi
     ;;
 
-  list|ls)
+  list|l|ls)
     limactl list
     ;;
 
   *)
-    cat >&2 <<EOF
-usage: $(basename "$0") <command> [args]
-
-templates live in: $TEMPLATES_DIR/
-default template: 'default' (uses $TEMPLATES_DIR/default.yaml)
-
-base images:
-  rebuild [-t <template>]         build/rebuild a base (default: 'default')
-  status                          show all templates and their bases
-
-engagements:
-  new <name> [src-dir] [-t <template>]
-                                  clone base from template (auto-builds on first use),
-                                  copy src-dir to ~/workspace, sync ~/.pi
-  attach   <name>                 SSH into VM, land in ~/workspace
-  sync-pi  <name>                 copy ~/.pi/ from Mac into running VM
-  commit   <name> [dest]          pull persistent/ to dest (VM stays alive)
-  end      <name> [dest]          pull persistent/ + destroy VM + cleanup SSH
-  list                            list all VMs
-
-env vars:
-  PIBOX_HOME               (default: ~/.pibox)
-  PIBOX_PERSIST_ROOT       where commits go (default: ~/pibox-output)
-  PIBOX_SSH_CONFIG_DIR     (default: ~/.ssh/pibox.config)
-  PIBOX_CPUS               (default: 8)
-  PIBOX_MEMORY             GiB (default: 16)
-  PIBOX_DISK               GiB (default: 200)
-  PIBOX_SKIP_PI_SYNC       set to skip ~/.pi sync on 'new'
-EOF
+    print_usage >&2
     exit 1
     ;;
 esac
