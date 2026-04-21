@@ -25,7 +25,6 @@ Commands:
 - `pibox delete <name> [dest]` or `pibox d <name> [dest]` — start the VM if needed, do a final copy of `persistent/`, then destroy the VM
 - `pibox status` — show all templates, which have built bases, disk sizes, tool versions
 - `pibox sync-pi <name>` — start the VM if needed, then copy `~/.pi/` from Mac into it
-- `pibox list` or `pibox l` — show all VMs
 
 The persistence rule is the whole point: **only files under `~/workspace/persistent/` survive the VM**. Everything else dies with it. This is the boundary that makes prompt injection cheap to recover from — whatever the agent did, you throw the VM away and you're clean.
 
@@ -106,7 +105,7 @@ After editing a template, `pibox rebuild -t <template>` to apply the changes. Ex
 PIBOX_CPUS=12 PIBOX_MEMORY=48 PIBOX_DISK=400 pibox rebuild -t big
 ```
 
-Defaults: 8 CPUs, 16 GiB RAM, 200 GiB disk (thin-provisioned).
+Defaults: 8 CPUs, 16 GiB RAM, 30 GiB disk (thin-provisioned).
 
 **Paths and behavior.** Override via env vars:
 
@@ -116,7 +115,7 @@ PIBOX_PERSIST_ROOT     where commits go           (default: ~/pibox-output)
 PIBOX_SSH_CONFIG_DIR   where SSH host files live  (default: ~/.ssh/pibox.config)
 PIBOX_CPUS             VM CPUs                    (default: 8)
 PIBOX_MEMORY           VM memory in GiB           (default: 16)
-PIBOX_DISK             VM disk in GiB             (default: 200)
+PIBOX_DISK             VM disk in GiB             (default: 30)
 PIBOX_SKIP_PI_SYNC     set to skip ~/.pi sync on 'new'
 ```
 

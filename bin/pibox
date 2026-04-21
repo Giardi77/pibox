@@ -34,7 +34,6 @@ engagements:
   sync-pi  <name>                 start if needed, then copy ~/.pi/ from Mac
   commit   <name> [dest]          start if needed, pull persistent/ to dest
   delete|d <name> [dest]          start if needed, final pull + destroy VM
-  list|l                          list all VMs
 
 env vars:
   PIBOX_HOME               (default: ~/.pibox)
@@ -42,7 +41,7 @@ env vars:
   PIBOX_SSH_CONFIG_DIR     (default: ~/.ssh/pibox.config)
   PIBOX_CPUS               (default: 8)
   PIBOX_MEMORY             GiB (default: 16)
-  PIBOX_DISK               GiB (default: 200)
+  PIBOX_DISK               GiB (default: 30)
   PIBOX_SKIP_PI_SYNC       set to skip ~/.pi sync on 'new'
 EOF
 }
@@ -242,7 +241,7 @@ build_base() {
     --name="$base" \
     --cpus="${PIBOX_CPUS:-8}" \
     --memory="${PIBOX_MEMORY:-16}" \
-    --disk="${PIBOX_DISK:-200}" \
+    --disk="${PIBOX_DISK:-30}" \
     --tty=false \
     "$template_file"
 
@@ -403,7 +402,6 @@ case "$cmd" in
       meta_dir="$CONTAINER_DIR/$template"
       echo "template: $template"
       echo "  file:    $tpl"
-      echo "  base vm: $base"
       if vm_exists "$base"; then
         if [[ -f "$meta_dir/built-at" ]]; then
           echo "  built:   $(cat "$meta_dir/built-at")"
@@ -411,12 +409,6 @@ case "$cmd" in
         lima_dir="$HOME/.lima/$base"
         if [[ -d "$lima_dir" ]]; then
           echo "  disk:    $(du -sh "$lima_dir" 2>/dev/null | awk '{print $1}')"
-        fi
-        if [[ -f "$meta_dir/manifest.txt" ]]; then
-          sed -n '/## tool versions/,/^## /p' "$meta_dir/manifest.txt" \
-            | sed '/^## /d;/^$/d;s/^/  /'
-          pkg_count=$(awk '/^## installed apt/{f=1; next} /^## /{f=0} f && /^[a-z]/' "$meta_dir/manifest.txt" | wc -l | tr -d ' ')
-          echo "  apt pkgs: $pkg_count"
         fi
       else
         echo "  status:  not built — run: pibox rebuild -t $template"
@@ -435,10 +427,6 @@ case "$cmd" in
     else
       echo "  (none)"
     fi
-    ;;
-
-  list|l|ls)
-    limactl list
     ;;
 
   *)
