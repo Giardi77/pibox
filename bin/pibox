@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PIBOX_HOME="${PIBOX_HOME:-$HOME/.pibox}"
+TEMPLATES_DIR="$PIBOX_HOME/templates"
+CONTAINER_DIR="$PIBOX_HOME/container"
+PERSIST_ROOT="${PIBOX_PERSIST_ROOT:-$HOME/pibox-output}"
+SSH_CONFIG_DIR="${PIBOX_SSH_CONFIG_DIR:-$HOME/.ssh/pibox.config}"
+SSH_CONFIG_FILE="$SSH_CONFIG_DIR/hosts"
+BASE_PREFIX="pibox-base-"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# ---------- template + base helpers ----------
+
+template_path() {
+  local name="$1"
+  local path="$TEMPLATES_DIR/$name.yaml"
+  [[ -f "$path" ]] || die "template not found: $path"
+  echo "$path"
+}
+
+base_name_for() {
+  # template "web" -> "pibox-base-web"
+  echo "${BASE_PREFIX}$1"
+}
+
+template_from_base() {
+  # "pibox-base-web" -> "web"
+  echo "${1#$BASE_PREFIX}"
+}
+
+# ---------- VM helpers ----------
+
+vm_home_of() {
+  limactl shell "$1" -- sh -c 'echo $HOME'
+}
+
+vm_exists() {
+  limactl list --format='{{.Name}}' 2>/dev/null | grep -qx "$1"
+}
+
+# ---------- pi config sync ----------
+
+sync_pi_config() {
+  local name="$1"
+  local vm_home="$2"
+  [[ -d "$HOME/.pi" ]] || { echo ">> no ~/.pi on this Mac, skipping"; return 0; }
+  echo ">> syncing ~/.pi to VM"
+  tar -C "$HOME" --no-xattrs \
+      --exclude='.pi/sessions' \
+      --exclude='.pi/logs' \
+      --exclude='.pi/*.log' \
+      -cf - .pi | \
+    limactl shell "$name" -- bash -c "tar -C '$vm_home' -xf -"
+}
+
+# ---------- SSH config management ----------
+
+ensure_ssh_config() {
+  mkdir -p "$SSH_CONFIG_DIR"
+  touch "$SSH_CONFIG_FILE"
+  chmod 600 "$SSH_CONFIG_FILE"
+
+  local main_config="$HOME/.ssh/config"
+  local include_line="Include pibox.config/*"
+
+  if [[ ! -f "$main_config" ]]; then
+    printf '%s\n\n' "$include_line" > "$main_config"
+    chmod 600 "$main_config"
+    echo ">> created $main_config with Include directive"
+  elif ! grep -qF "$include_line" "$main_config"; then
+    local tmp
+    tmp=$(mktemp)
+    { printf '%s\n\n' "$include_line"; cat "$main_config"; } > "$tmp"
+    mv "$tmp" "$main_config"
+    chmod 600 "$main_config"
+    echo ">> added Include directive to $main_config"
+  fi
+}
+
+register_ssh_host() {
+  local name="$1"
+  ensure_ssh_config
+  remove_ssh_host "$name"
+  {
+    echo "# === pibox: $name ==="
+    limactl show-ssh --format=config "$name" | sed "s/^Host lima-$name\$/Host $name/"
+    echo "# === end: $name ==="
+    echo
+  } >> "$SSH_CONFIG_FILE"
+}
+
+remove_ssh_host() {
+  local name="$1"
+  [[ -f "$SSH_CONFIG_FILE" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk -v name="$name" '
+    $0 == "# === pibox: " name " ===" { skip=1; next }
+    $0 == "# === end: " name " ===" { skip=0; next }
+    !skip { print }
+  ' "$SSH_CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$SSH_CONFIG_FILE"
+  chmod 600 "$SSH_CONFIG_FILE"
+}
+
+# ---------- build ----------
+
+write_metadata() {
+  local template="$1"
+  local base="$(base_name_for "$template")"
+  local meta_dir="$CONTAINER_DIR/$template"
+  mkdir -p "$meta_dir"
+  date -u +"%Y-%m-%dT%H:%M:%SZ" > "$meta_dir/built-at"
+
+  {
+    echo "# pibox base: $base"
+    echo "template: $template"
+    echo "built: $(cat "$meta_dir/built-at")"
+    echo ""
+    echo "## tool versions"
+    limactl shell "$base" -- bash -lc '
+      printf "pi: %s\n"   "$(pi --version 2>/dev/null || echo missing)"
+      printf "bun: %s\n"  "$(bun --version 2>/dev/null || echo missing)"
+      printf "node: %s\n" "$(node --version 2>/dev/null || echo missing)"
+      printf "python3: %s\n" "$(python3 --version 2>/dev/null || echo missing)"
+    ' 2>/dev/null
+    echo ""
+    echo "## installed apt packages (top-level)"
+    limactl shell "$base" -- bash -lc 'apt-mark showmanual 2>/dev/null | sort' 2>/dev/null
+  } > "$meta_dir/manifest.txt"
+}
+
+build_base() {
+  local template="$1"
+  local template_file="$(template_path "$template")"
+  local base="$(base_name_for "$template")"
+
+  echo ">> building $base from $template_file"
+
+  if vm_exists "$base"; then
+    echo ">> removing existing $base"
+    limactl stop --force "$base" 2>/dev/null || true
+    limactl delete --force "$base"
+  fi
+
+  limactl start \
+    --name="$base" \
+    --cpus="${PIBOX_CPUS:-8}" \
+    --memory="${PIBOX_MEMORY:-16}" \
+    --disk="${PIBOX_DISK:-200}" \
+    --tty=false \
+    "$template_file"
+
+  echo ">> writing metadata"
+  write_metadata "$template"
+
+  echo ">> stopping $base (only runs during builds)"
+  limactl stop "$base"
+
+  echo ">> done. inspect with: pibox status"
+}
+
+ensure_base() {
+  local template="$1"
+  local base="$(base_name_for "$template")"
+  if vm_exists "$base"; then
+    return 0
+  fi
+  echo ">> no $base found — building from template '$template'"
+  build_base "$template"
+}
+
+# ---------- arg parsing helpers ----------
+
+# takes: all remaining args after the command
+# sets: TEMPLATE (default: "default"), POSITIONAL (array of non-flag args)
+parse_template_flag() {
+  TEMPLATE="default"
+  POSITIONAL=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--template)
+        TEMPLATE="${2:?-t requires a template name}"
+        shift 2
+        ;;
+      -t=*|--template=*)
+        TEMPLATE="${1#*=}"
+        shift
+        ;;
+      *)
+        POSITIONAL+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+# ---------- main ----------
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  rebuild)
+    parse_template_flag "$@"
+    build_base "$TEMPLATE"
+    ;;
+
+  new)
+    parse_template_flag "$@"
+    name="${POSITIONAL[0]:?usage: new <name> [src-dir] [-t template]}"
+    src="${POSITIONAL[1]:-$PWD}"
+    [[ -d "$src" ]] || die "source dir not found: $src"
+
+    base="$(base_name_for "$TEMPLATE")"
+    [[ "$name" == pibox-base-* ]] && die "names starting with 'pibox-base-' are reserved"
+
+    ensure_base "$TEMPLATE"
+
+    echo ">> cloning $base -> $name"
+    limactl clone "$base" "$name"
+    limactl start "$name"
+
+    vm_home=$(vm_home_of "$name")
+
+    echo ">> copying workspace from $src"
+    tar -C "$src" --no-xattrs -cf - . | \
+      limactl shell "$name" -- bash -c "mkdir -p '$vm_home/workspace' && tar -C '$vm_home/workspace' -xf -"
+
+    limactl shell "$name" -- bash -c "mkdir -p '$vm_home/workspace/persistent'"
+
+    if [[ -z "${PIBOX_SKIP_PI_SYNC:-}" ]]; then
+      sync_pi_config "$name" "$vm_home"
+    fi
+
+    echo ">> registering SSH host"
+    register_ssh_host "$name"
+
+    echo ">> ready ($TEMPLATE). connect with: ssh $name"
+    ;;
+
+  attach)
+    name="${1:?usage: attach <name>}"
+    ssh -t "$name" 'cd "$HOME/workspace" && exec $SHELL -l'
+    ;;
+
+  sync-pi)
+    name="${1:?usage: sync-pi <name>}"
+    vm_home=$(vm_home_of "$name")
+    sync_pi_config "$name" "$vm_home"
+    ;;
+
+  commit)
+    name="${1:?usage: commit <name> [dest-dir]}"
+    dest="${2:-$PERSIST_ROOT/$name-$(date +%Y%m%d-%H%M%S)}"
+    mkdir -p "$dest"
+    vm_home=$(vm_home_of "$name")
+    echo ">> pulling persistent/ -> $dest"
+    limactl shell "$name" -- tar -C "$vm_home/workspace/persistent" -cf - . | \
+      tar -C "$dest" -xf -
+    echo ">> committed to $dest"
+    ;;
+
+  end)
+    name="${1:?usage: end <name> [dest-dir]}"
+    [[ "$name" == pibox-base-* ]] && die "use 'pibox rebuild -t <template>' to refresh a base"
+    dest="${2:-$PERSIST_ROOT/$name-final-$(date +%Y%m%d-%H%M%S)}"
+    mkdir -p "$dest"
+
+    vm_home=$(vm_home_of "$name" 2>/dev/null || echo "")
+    if [[ -n "$vm_home" ]]; then
+      echo ">> final pull of persistent/ -> $dest"
+      limactl shell "$name" -- tar -C "$vm_home/workspace/persistent" -cf - . | \
+        tar -C "$dest" -xf - || echo "warning: persistent pull failed, continuing"
+    else
+      echo "warning: could not query VM home, skipping pull"
+    fi
+
+    echo ">> stopping and destroying VM"
+    limactl stop --force "$name" 2>/dev/null || true
+    limactl delete --force "$name"
+
+    echo ">> removing SSH host entry"
+    remove_ssh_host "$name"
+
+    echo ">> done. output in $dest"
+    ;;
+
+  status)
+    # list all templates and whether each has a built base
+    shopt -s nullglob
+    any=0
+    for tpl in "$TEMPLATES_DIR"/*.yaml; do
+      any=1
+      template="$(basename "$tpl" .yaml)"
+      base="$(base_name_for "$template")"
+      meta_dir="$CONTAINER_DIR/$template"
+      echo "template: $template"
+      echo "  file:    $tpl"
+      echo "  base vm: $base"
+      if vm_exists "$base"; then
+        if [[ -f "$meta_dir/built-at" ]]; then
+          echo "  built:   $(cat "$meta_dir/built-at")"
+        fi
+        lima_dir="$HOME/.lima/$base"
+        if [[ -d "$lima_dir" ]]; then
+          echo "  disk:    $(du -sh "$lima_dir" 2>/dev/null | awk '{print $1}')"
+        fi
+        if [[ -f "$meta_dir/manifest.txt" ]]; then
+          sed -n '/## tool versions/,/^## /p' "$meta_dir/manifest.txt" \
+            | sed '/^## /d;/^$/d;s/^/  /'
+          pkg_count=$(awk '/^## installed apt/{f=1; next} /^## /{f=0} f && /^[a-z]/' "$meta_dir/manifest.txt" | wc -l | tr -d ' ')
+          echo "  apt pkgs: $pkg_count"
+        fi
+      else
+        echo "  status:  not built — run: pibox rebuild -t $template"
+      fi
+      echo ""
+    done
+    [[ $any -eq 0 ]] && echo "no templates found in $TEMPLATES_DIR"
+
+    echo "active pibox VMs:"
+    active=$(limactl list --format='{{.Name}}\t{{.Status}}' 2>/dev/null | grep -v "^pibox-base-" || true)
+    if [[ -n "$active" ]]; then
+      echo "$active" | sed 's/^/  /'
+    else
+      echo "  (none)"
+    fi
+    ;;
+
+  list|ls)
+    limactl list
+    ;;
+
+  *)
+    cat >&2 <<EOF
+usage: $(basename "$0") <command> [args]
+
+templates live in: $TEMPLATES_DIR/
+default template: 'default' (uses $TEMPLATES_DIR/default.yaml)
+
+base images:
+  rebuild [-t <template>]         build/rebuild a base (default: 'default')
+  status                          show all templates and their bases
+
+engagements:
+  new <name> [src-dir] [-t <template>]
+                                  clone base from template (auto-builds on first use),
+                                  copy src-dir to ~/workspace, sync ~/.pi
+  attach   <name>                 SSH into VM, land in ~/workspace
+  sync-pi  <name>                 copy ~/.pi/ from Mac into running VM
+  commit   <name> [dest]          pull persistent/ to dest (VM stays alive)
+  end      <name> [dest]          pull persistent/ + destroy VM + cleanup SSH
+  list                            list all VMs
+
+env vars:
+  PIBOX_HOME               (default: ~/.pibox)
+  PIBOX_PERSIST_ROOT       where commits go (default: ~/pibox-output)
+  PIBOX_SSH_CONFIG_DIR     (default: ~/.ssh/pibox.config)
+  PIBOX_CPUS               (default: 8)
+  PIBOX_MEMORY             GiB (default: 16)
+  PIBOX_DISK               GiB (default: 200)
+  PIBOX_SKIP_PI_SYNC       set to skip ~/.pi sync on 'new'
+EOF
+    exit 1
+    ;;
+esac
