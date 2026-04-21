@@ -199,6 +199,17 @@ parse_template_flag() {
 
 # ---------- main ----------
 
+case "${1:-}" in
+  --help|-h|help)
+    # your existing usage block
+    exit 0
+    ;;
+  --version|-V|version)
+    echo "pibox 0.1.0"
+    exit 0
+    ;;
+esac
+
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
