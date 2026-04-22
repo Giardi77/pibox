@@ -83,7 +83,7 @@ vm_home_of() {
 }
 
 vm_exists() {
-  limactl list --format='{{.Name}}' 2>/dev/null | grep -qx "$1"
+  limactl list "$1" --format='{{.Name}}' >/dev/null 2>&1
 }
 
 vm_status() {
